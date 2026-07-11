@@ -5,19 +5,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import httpx
 import config
+import asyncio
+
 app = FastAPI()
+
 # CORS wide open — grader calls from a Cloudflare Worker
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"],
     allow_headers=["*"], allow_credentials=False,
 )
+
 HEAD = {"Authorization": f"Bearer {config.AIPIPE_TOKEN}",
         "Content-Type": "application/json"}
+
 # --- tiny in-memory cache so repeated grader calls don't cost twice ---
 _CACHE = {}
 def _ck(*parts):
     return hashlib.sha256("||".join(map(str, parts)).encode()).hexdigest()
-import asyncio
+
 async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4):
     key = _ck("chat", model, json.dumps(messages, sort_keys=True, default=str))
     if key in _CACHE:
@@ -40,6 +45,7 @@ async def chat(messages, model=None, max_tokens=800, force_json=True, retries=4)
             _CACHE[key] = out
             return out
     raise RuntimeError(f"chat failed after {retries} retries: {last_err}")
+
 # Gemini models to try in order for audio transcription. If one is overloaded (503)
 # or rate-limited (429), we retry it, then fall through to the next.
 GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash", "gemini-2.0-flash",
@@ -83,9 +89,11 @@ def parse_json(s):
     except Exception:
         m = re.search(r"\{.*\}", s, re.DOTALL)
         return json.loads(m.group(0)) if m else {}
+
 @app.get("/")
 async def root():
     return {"ok": True, "email": config.EMAIL}
+
 # ================= Q2: /answer-image =================
 def normalize_answer(ans):
     """Clean a vision answer so it matches the grader's expected string.
@@ -141,6 +149,7 @@ async def answer_image(request: Request):
     except Exception as e:
         ans = ""
     return {"answer": str(ans)}
+
 # ================= Q3 + Q7: /extract =================
 @app.post("/extract")
 async def extract(request: Request):
@@ -277,15 +286,12 @@ def get_debug():
 @app.get("/transcripts")
 def get_transcripts():
     """Full history of EVERY audio the grader has sent this session — each with its
-    transcript, the LLM's raw extraction, and the final answer we returned. Open
-    https://<your>.hf.space/transcripts in a browser. Newest first."""
+    transcript, the LLM's raw extraction, and the final answer we returned."""
     return {"count": len(audio_history), "calls": list(reversed(audio_history))}
 
 @app.get("/last-audio")
 def get_last_audio():
-    """Download the EXACT audio file the grader last posted, so you can listen to
-    it and see its real format. Open https://<your>.hf.space/last-audio in a
-    browser after clicking Check on Q6 — it downloads the file."""
+    """Download the EXACT audio file the grader last posted."""
     from fastapi.responses import Response
     ext = {"audio/mp3": "mp3", "audio/ogg": "ogg", "audio/flac": "flac",
            "audio/wav": "wav", "audio/mpeg": "mp3"}.get(last_audio_mime, "bin")
@@ -294,8 +300,6 @@ def get_last_audio():
         headers={"Content-Disposition": f'attachment; filename="q6_audio.{ext}"'})
 
 def _find_audio_b64(body):
-    """The grader's key names aren't guaranteed. Scan the JSON body for the audio
-    id and the base64 blob no matter what they're called."""
     audio_id, audio_b64 = None, ""
     if isinstance(body, dict):
         for k, v in body.items():
@@ -310,14 +314,8 @@ def _find_audio_b64(body):
 
 @app.post("/answer-audio")
 async def answer_audio(request: Request):
-    """
-    Q6: Audio extraction. Grader sends an audio file.
-    Returns the fixed key structure the grader expects.
-    """
     global last_debug_info, last_audio_bytes, last_audio_mime
 
-    # --- Capture the FULL raw request so we can see exactly what the grader sends,
-    #     regardless of key names or JSON vs multipart. ---
     raw = await request.body()
     ctype = request.headers.get("content-type", "")
     last_debug_info = {"content_type": ctype, "raw_len": len(raw)}
@@ -329,7 +327,6 @@ async def answer_audio(request: Request):
             last_debug_info["body_keys"] = list(body.keys()) if isinstance(body, dict) else "non-dict"
             audio_id, audio_b64 = _find_audio_b64(body)
         else:
-            # multipart / raw upload: try FastAPI's form parser, else treat raw as the file
             try:
                 form = await request.form()
                 last_debug_info["form_keys"] = list(form.keys())
@@ -350,11 +347,9 @@ async def answer_audio(request: Request):
     transcript = ""
     try:
         audio = base64.b64decode(audio_b64) if audio_b64 else last_audio_bytes
-        last_audio_bytes = audio          # keep raw bytes for /last-audio download
-        last_debug_info["magic_bytes"] = audio[:16].hex()   # first bytes -> real format
+        last_audio_bytes = audio          
+        last_debug_info["magic_bytes"] = audio[:16].hex()   
 
-        # Detect audio format from magic bytes and use the CORRECT mime type.
-        # (Hardcoding audio/mp3 breaks students whose seeded audio is WAV/OGG/FLAC.)
         if audio.startswith(b"ID3") or audio[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
             mime = "audio/mp3"
         elif audio.startswith(b"OggS"):
@@ -363,18 +358,15 @@ async def answer_audio(request: Request):
             mime = "audio/flac"
         elif audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
             mime = "audio/wav"
-        elif audio.startswith(b"\x1aE\xdf\xa3"):     # EBML -> webm/matroska (mp4-ish container)
+        elif audio.startswith(b"\x1aE\xdf\xa3"):     
             mime = "audio/webm"
-        elif audio[4:8] == b"ftyp":                   # MP4/M4A container
+        elif audio[4:8] == b"ftyp":                   
             mime = "audio/mp4"
         else:
-            mime = "audio/wav"   # safe default
+            mime = "audio/wav"   
         last_audio_mime = mime
         last_debug_info["detected_mime"] = mime
 
-        # AIPipe's OpenAI /audio/transcriptions is broken; Gemini handles audio in JSON.
-        # Gemini can return 503 ("model overloaded") under load, so RETRY with backoff
-        # and FALL BACK across several Gemini models until one answers.
         payload = {
             "contents": [{
                 "parts": [
@@ -390,7 +382,6 @@ async def answer_audio(request: Request):
 
     last_debug_info["transcript"] = transcript
 
-    # Step 1: LLM extracts structured data AND identifies requested statistics
     prompt = (
         "The transcript (Korean) describes a tabular dataset and asks for or states specific statistics. "
         "Extract the raw data, schema, and identify/extract the exact statistics.\n"
@@ -427,28 +418,13 @@ async def answer_audio(request: Request):
         "1. DO NOT confuse '중간값'/'중앙값' (median) with '평균' (mean). Map them carefully using the mapping guide above.\n"
         "2. DO NOT invent data. Extract all rows exactly as dictated.\n"
         "3. Keep column names exactly as spoken.\n"
-        "4. allowed_values is for CATEGORICAL columns whose text explicitly lists a "
-        "fixed permitted set. This is triggered by EITHER '허용값'/'허용된 값' OR a "
-        "'one-of' enumeration: '<col>는/은 A, B, C 중 하나입니다' (col is one of A,B,C), "
-        "'<col>는 상/중/하 중 하나', '또는'/'혹은' choices, etc. In those cases emit "
-        "explicit_stats.allowed_values={\"<col>\": [\"A\",\"B\",\"C\"]} AND put <col> in "
-        "'columns' AND put 'allowed_values' in requested_stats. For purely numeric "
-        "columns like 나이/몸무게/키/점수/소득 with NO listed category set, NEVER emit "
-        "allowed_values.\n"
-        "5. correlation MUST be a LIST of objects {\"x\": colA, \"y\": colB, \"type\": "
-        "\"positive\"|\"negative\"} — one per stated relationship. When the audio says "
-        "'A와 B는 양의 상관관계' put both column names in 'columns' AND emit "
-        "explicit_stats.correlation=[{\"x\":\"A\",\"y\":\"B\",\"type\":\"positive\"}]. "
-        "'양의'/비례=positive, '음의'/반비례=negative. NEVER output a correlation matrix.\n"
-        "6. If the transcript states a constraint like '값은 0에서 1 사이입니다', you MUST "
-        "extract the subject ('값', '점수', etc.) as the column name into the 'columns' "
-        "list, AND map the constraint to it in 'explicit_stats' (e.g. value_range: {'값': [0, 1]}). "
-        "NEVER leave 'columns' empty if a constraint is mentioned.\n\n"
+        "4. allowed_values is for CATEGORICAL columns whose text explicitly lists a fixed permitted set.\n"
+        "5. correlation MUST be a LIST of objects {\"x\": colA, \"y\": colB, \"type\": \"positive\"|\"negative\"}.\n"
+        "6. If the transcript states a constraint like '값은 0에서 1 사이입니다', you MUST extract the subject as the column name into the 'columns' list.\n\n"
         f"TRANSCRIPT:\n{transcript}"
     )
     columns, data_rows, req_stats, num_rows, explicit_stats = [], [], [], None, {}
     try:
-        # Use gpt-4o (the strongest model) for precise translation and schema extraction
         raw_llm = await chat([{"role": "user", "content": prompt}], model="gpt-4o", max_tokens=1500)
         last_debug_info["raw_llm"] = raw_llm
         ext = parse_json(raw_llm)
@@ -460,20 +436,15 @@ async def answer_audio(request: Request):
     except Exception:
         pass
 
-    # Deterministic safety net for allowed_values (categorical 'one-of' sets). The
-    # model frequently drops these entirely (empty explicit_stats/requested_stats),
-    # e.g. transcript "카테고리는 A, B, C 중 하나입니다" -> allowed_values={카테고리:[A,B,C]}.
     def _extract_allowed_values(tr):
         found = {}
         if not tr:
             return found
-        # '<col>는/은/이/가 <v1>, <v2>, ... 중 하나/에서' (col is one of ...)
         for m in re.finditer(r"([가-힣A-Za-z0-9_]+?)(?:는|은|이|가)\s+([^.。\n]+?)\s*중\s*(?:하나|에서)", tr):
             col = m.group(1).strip()
             vals = [v.strip() for v in re.split(r"[,、/]|또는|혹은", m.group(2)) if v.strip()]
             if col and len(vals) >= 2:
                 found[col] = vals
-        # '<col> 허용값(은/는) A, B, C(입니다)'
         for m in re.finditer(r"([가-힣A-Za-z0-9_]+?)(?:의|는|은)?\s*허용(?:값|된\s*값)[은는]?\s*[:：]?\s*([^.。\n]+)", tr):
             col = m.group(1).strip()
             rawv = re.sub(r"(입니다|이다)\s*$", "", m.group(2).strip())
@@ -492,9 +463,6 @@ async def answer_audio(request: Request):
                  "range", "allowed_values", "value_range", "correlation"]):
             req_stats.append("allowed_values")
 
-    # The model often names a column ONLY inside explicit_stats (e.g. median:{"소득":45000})
-    # and forgets to list it in `columns`. The grader checks `columns` strictly, so
-    # rebuild it from every column referenced in explicit_stats / data.
     referenced = []
     for sd in (explicit_stats or {}).values():
         if isinstance(sd, dict):
@@ -507,6 +475,9 @@ async def answer_audio(request: Request):
 
     if not req_stats:
         req_stats = ["mean", "std", "variance", "min", "max", "median", "mode", "range", "allowed_values", "value_range", "correlation"]
+
+    # --- Whitespace Normalization to handle strict grader checks ("점수 1" -> "점수1") ---
+    columns = [str(c).replace(" ", "").strip() for c in columns if c]
 
     actual_rows = num_rows if num_rows is not None else len(data_rows)
     out = {"rows": actual_rows, "columns": columns,
@@ -542,10 +513,6 @@ async def answer_audio(request: Request):
         if "range" in req_stats: out["range"][name] = max(v) - min(v)
         if "value_range" in req_stats: out["value_range"][name] = [min(v), max(v)]
 
-    # ---- Correlation: the grader wants a LIST of {x, y, type} relationship objects,
-    # e.g. [{"x":"키","y":"몸무게","type":"positive"}] — NOT a numeric matrix.
-    # The audio says things like "키와 몸무게는 양의 상관관계를 가집니다"
-    # (height and weight have a positive correlation).
     def _corr_type(tr, hint=""):
         h = str(hint).lower()
         if h in ("positive", "negative"):
@@ -553,23 +520,23 @@ async def answer_audio(request: Request):
         t = (tr or "")
         if "음의" in t or "반비례" in t or "negative" in t.lower():
             return "negative"
-        return "positive"   # 양의 / 비례 / default
+        return "positive"   
 
     corr_list = []
     raw_corr = explicit_stats.get("correlation")
     if isinstance(raw_corr, list):
         for item in raw_corr:
             if isinstance(item, dict) and item.get("x") and item.get("y"):
-                corr_list.append({"x": item["x"], "y": item["y"],
+                corr_list.append({"x": str(item["x"]).replace(" ", "").strip(), 
+                                  "y": str(item["y"]).replace(" ", "").strip(),
                                   "type": _corr_type(transcript, item.get("type", ""))})
     elif isinstance(raw_corr, dict):
-        # model collapsed it to {x: y} and dropped the type -> rebuild, infer sign from audio
         for x, y in raw_corr.items():
             if isinstance(y, str) and y:
-                corr_list.append({"x": x, "y": y, "type": _corr_type(transcript)})
+                corr_list.append({"x": str(x).replace(" ", "").strip(), 
+                                  "y": str(y).replace(" ", "").strip(), 
+                                  "type": _corr_type(transcript)})
     if not corr_list and cols_vals and len(columns) > 1 and all(cols_vals) and "correlation" in req_stats:
-        # Data present but no explicit statement: derive sign of Pearson r per column pair.
-        import math
         for i in range(len(columns)):
             for j in range(i + 1, len(columns)):
                 a, b = cols_vals[i], cols_vals[j]
@@ -581,12 +548,6 @@ async def answer_audio(request: Request):
     if corr_list:
         out["correlation"] = corr_list
 
-    # ---- Decide the EXACT set of stats the grader wants (the whole ballgame) ----
-    # The model sets requested_stats to the FULL list as its "nothing specific was
-    # asked, only a constraint was stated" signal. In that case the grader wants
-    # EXACTLY the stats present in explicit_stats and NOTHING derived. Only when the
-    # model names a SPECIFIC short list (e.g. 최솟값/최댓값 -> ["min","max"]) is that
-    # list the authority for which keys to fill / cross-derive.
     FULL = ["mean", "std", "variance", "min", "max", "median", "mode",
             "range", "allowed_values", "value_range", "correlation"]
     has_data = len(data_rows) > 0
@@ -596,15 +557,12 @@ async def answer_audio(request: Request):
         return (isinstance(v, dict) and bool(v)) or (isinstance(v, list) and bool(v))
 
     if req_stats and set(req_stats) != set(FULL):
-        target = [s for s in FULL if s in req_stats]      # model named specific stats
+        target = [s for s in FULL if s in req_stats]      
     elif has_data:
-        target = list(FULL)                               # data given, no ask -> all computable
+        target = list(FULL)                               
     else:
-        target = [s for s in FULL if _present(s)]         # only a constraint was stated
+        target = [s for s in FULL if _present(s)]         
 
-    # Cross-populate min/max/range/value_range ONLY toward keys in `target` that the
-    # model filed under a sibling (heard 최솟값/최댓값 but wrote value_range, etc.).
-    # Never derive a stat the grader did not ask for — that was the '점수 사이' leak.
     vr = explicit_stats.get("value_range")
     if isinstance(vr, dict):
         for col, bounds in vr.items():
@@ -625,13 +583,19 @@ async def answer_audio(request: Request):
                     try: explicit_stats.setdefault("range", {}).setdefault(col, emax[col] - emin[col])
                     except Exception: pass
 
-    # Merge every explicit stat into the output.
+    # Normalize explicit_stats dictionary keys before merging
+    cleaned_explicit_stats = {}
     for stat_name, stat_dict in explicit_stats.items():
+        if isinstance(stat_dict, dict):
+            cleaned_explicit_stats[stat_name] = {k.replace(" ", "").strip(): v for k, v in stat_dict.items()}
+        else:
+            cleaned_explicit_stats[stat_name] = stat_dict
+
+    # Merge every explicit stat into the output
+    for stat_name, stat_dict in cleaned_explicit_stats.items():
         if stat_name in out and isinstance(out[stat_name], dict) and isinstance(stat_dict, dict):
             out[stat_name].update(stat_dict)
 
-    # Trim to EXACTLY the target key set so the grader's key-set check passes both
-    # ways — no missing keys, no leaked siblings.
     for k in FULL:
         if k == "correlation":
             continue
@@ -640,7 +604,6 @@ async def answer_audio(request: Request):
     if "correlation" not in target:
         out["correlation"] = []
 
-    # --- record this call in the full history (cap at 50 so memory stays bounded) ---
     audio_history.append({
         "audio_id": last_debug_info.get("body_id"),
         "detected_mime": last_debug_info.get("detected_mime"),
@@ -694,7 +657,6 @@ async def solve(request: Request):
         f"PROBLEM:\n{problem}"
     )
     try:
-        # Q9 is graded on exact integer correctness -> use the strongest model.
         out = parse_json(await chat([{"role": "user", "content": prompt}],
                                     model="gpt-4o", max_tokens=1200))
         ans = int(round(float(out.get("answer"))))
